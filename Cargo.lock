@@ -1222,6 +1222,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipnetwork"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f84f1612606f3753f205a4e9a2efd6fe5b4c573a6269b2cc6c3003d44a0d127"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "itertools"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1519,7 +1528,7 @@ dependencies = [
  "git_rev",
  "heck 0.4.0",
  "http",
- "ipnetwork",
+ "ipnetwork 0.19.0",
  "log",
  "num-traits",
  "open",
@@ -1572,7 +1581,7 @@ dependencies = [
  "chrono-humanize",
  "http",
  "hyperx",
- "ipnetwork",
+ "ipnetwork 0.18.0",
  "log",
  "mime",
  "parse-display",
