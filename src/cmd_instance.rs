@@ -1,8 +1,13 @@
 use std::io::Write;
+use std::os::unix::prelude::AsRawFd;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message;
 use cli_macro::crud_gen;
+use futures::{SinkExt, StreamExt};
 
 /// Create, list, edit, view, and delete instances.
 ///
@@ -493,12 +498,57 @@ pub struct CmdInstanceSerial {
     /// Whether to continuously read from the running instance's output.
     #[clap(long, short)]
     pub continuous: bool,
+
+    /// Whether to connect interactively (read/write) to the running instance's serial console.
+    /// (NOTE: ignores --byte-offset, --max-bytes, and --continuous)
+    #[clap(long, short)]
+    pub interactive: bool,
+}
+
+/// Guard object that will set the terminal to raw mode and restore it
+/// to its previous state when it's dropped
+struct RawTermiosGuard(libc::c_int, libc::termios);
+
+impl RawTermiosGuard {
+    fn stdio_guard() -> Result<RawTermiosGuard, std::io::Error> {
+        let fd = std::io::stdout().as_raw_fd();
+        let termios = unsafe {
+            let mut curr_termios = std::mem::zeroed();
+            let r = libc::tcgetattr(fd, &mut curr_termios);
+            if r == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            curr_termios
+        };
+        let guard = RawTermiosGuard(fd, termios);
+        unsafe {
+            let mut raw_termios = termios;
+            libc::cfmakeraw(&mut raw_termios);
+            let r = libc::tcsetattr(fd, libc::TCSAFLUSH, &raw_termios);
+            if r == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(guard)
+    }
+}
+impl Drop for RawTermiosGuard {
+    fn drop(&mut self) {
+        let r = unsafe { libc::tcsetattr(self.0, libc::TCSADRAIN, &self.1) };
+        if r == -1 {
+            Err::<(), _>(std::io::Error::last_os_error()).unwrap();
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl crate::cmd::Command for CmdInstanceSerial {
     async fn run(&self, ctx: &mut crate::context::Context) -> Result<()> {
         let client = ctx.api_client("")?;
+
+        if self.interactive {
+            return self.websock_stream_tty(client).await;
+        }
 
         let mut from_start = None;
         let mut most_recent = None;
@@ -536,6 +586,146 @@ impl crate::cmd::Command for CmdInstanceSerial {
         }
 
         println!("\x1b[0m");
+
+        Ok(())
+    }
+}
+
+async fn stdin_to_websockets_task(
+    mut stdinrx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    wstx: tokio::sync::mpsc::Sender<Vec<u8>>,
+) {
+    // next_raw must live outside loop, because Ctrl-A should work across
+    // multiple inbuf reads.
+    let mut next_raw = false;
+
+    loop {
+        let inbuf = if let Some(inbuf) = stdinrx.recv().await {
+            inbuf
+        } else {
+            continue;
+        };
+
+        // Put bytes from inbuf to outbuf, but don't send Ctrl-A unless
+        // next_raw is true.
+        let mut outbuf = Vec::with_capacity(inbuf.len());
+
+        let mut exit = false;
+        for c in inbuf {
+            match c {
+                // Ctrl-A means send next one raw
+                b'\x01' => {
+                    if next_raw {
+                        // Ctrl-A Ctrl-A should be sent as Ctrl-A
+                        outbuf.push(c);
+                        next_raw = false;
+                    } else {
+                        next_raw = true;
+                    }
+                }
+                b'\x03' => {
+                    if !next_raw {
+                        // Exit on non-raw Ctrl-C
+                        exit = true;
+                        break;
+                    } else {
+                        // Otherwise send Ctrl-C
+                        outbuf.push(c);
+                        next_raw = false;
+                    }
+                }
+                _ => {
+                    outbuf.push(c);
+                    next_raw = false;
+                }
+            }
+        }
+
+        // Send what we have, even if there's a Ctrl-C at the end.
+        if !outbuf.is_empty() {
+            wstx.send(outbuf).await.unwrap();
+        }
+
+        if exit {
+            break;
+        }
+    }
+}
+
+impl CmdInstanceSerial {
+    async fn websock_stream_tty(&self, client: oxide_api::Client) -> Result<()> {
+        let uri = format!(
+            "/organizations/{}/projects/{}/instances/{}/serial-console/stream",
+            self.organization,
+            self.project,
+            self.instance,
+        );
+        let reqw = client.request_raw(http::Method::GET, &uri, None)
+            .await?
+            .build()?;
+
+        let mut url = reqw.url().to_owned();
+        url.set_scheme(&url.scheme().replace("http", "ws"))
+            .or_else(|()| anyhow::bail!("couldn't change protocol scheme"))?;
+        let mut req = url.into_client_request()?;
+        req.headers_mut().insert(
+            http::header::AUTHORIZATION,
+            reqw.headers().get(http::header::AUTHORIZATION).unwrap().to_owned(),
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+
+        let _raw_guard = RawTermiosGuard::stdio_guard()
+            .expect("failed to set raw mode");
+
+        let mut stdout = tokio::io::stdout();
+
+        // https://docs.rs/tokio/latest/tokio/io/trait.AsyncReadExt.html#method.read_exact
+        // is not cancel safe! Meaning reads from tokio::io::stdin are not cancel
+        // safe. Spawn a separate task to read and put bytes onto this channel.
+        let (stdintx, stdinrx) = tokio::sync::mpsc::channel(16);
+        let (wstx, mut wsrx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let mut inbuf = [0u8; 1024];
+
+            loop {
+                let n = match stdin.read(&mut inbuf).await {
+                    Err(_) | Ok(0) => break,
+                    Ok(n) => n,
+                };
+
+                stdintx.send(inbuf[0..n].to_vec()).await.unwrap();
+            }
+        });
+
+        tokio::spawn(async move { stdin_to_websockets_task(stdinrx, wstx).await });
+
+        loop {
+            tokio::select! {
+                c = wsrx.recv() => {
+                    match c {
+                        None => {
+                            // channel is closed
+                            break;
+                        }
+                        Some(c) => {
+                            ws.send(Message::Binary(c)).await?;
+                        },
+                    }
+                }
+                msg = ws.next() => {
+                    match msg {
+                        Some(Ok(Message::Binary(input))) => {
+                            stdout.write_all(&input).await?;
+                            stdout.flush().await?;
+                        }
+                        Some(Ok(Message::Close(..))) | None => break,
+                        _ => continue,
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
